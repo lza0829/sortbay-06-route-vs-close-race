@@ -37,9 +37,22 @@ export default function Bags() {
   }
   return (
     <div className="panel">
-      <h2>封袋</h2>
+      <h2>封袋 · 口门压力</h2>
       {msg && <div className="msg">{msg}</div>}
       {err && <div className="err">{err}</div>}
+
+      <div className="grid pressure-grid" data-testid="bag-pressure">
+        {chutes.map((c) => (
+          <div className="stat" key={c.id}>
+            <div className="n">{c.在口件数 ?? '–'}</div>
+            <div className="l">
+              {c.code} · {c.压力等级 || '–'}
+              {c.建议封袋 ? ' · 建议封袋' : ''}
+            </div>
+          </div>
+        ))}
+      </div>
+
       <div className="row">
         <label>口门
           <select value={chuteId} onChange={(e) => setChuteId(e.target.value)}>

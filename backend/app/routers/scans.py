@@ -1,8 +1,9 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from app.db import db, rows_to_list, row_to_dict
+from app.db import db, run_write
 from app.services.common import audit, current_shift, now_str, require_unsealed
+from app.services import collision, views
 
 router = APIRouter(tags=["过机扫描"])
 
@@ -14,24 +15,49 @@ class ScanIn(BaseModel):
     备注: str = ""
 
 
+class AdjudicateIn(BaseModel):
+    扫描编号: int | None = None
+    scan_id: int | None = None
+    id: int | None = None
+    条码: str | None = None
+    barcode: str | None = None
+
+
 @router.get("/扫描")
-def list_scans(状态: str | None = None):
+def list_scans(状态: str | None = None, status: str | None = None):
+    state = 状态 or status
     with db() as conn:
-        if 状态:
+        if state:
             rows = conn.execute(
-                "SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT 200", (状态,)
+                "SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT 200", (state,)
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 200").fetchall()
-        return rows_to_list(rows)
+        return [views.scan_view(conn, r) for r in rows]
+
+
+@router.get("/扫描册")
+def scan_book():
+    with db() as conn:
+        return views.scan_book(conn, 200)
+
+
+@router.get("/扫描/{scan_id}")
+def get_scan(scan_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "扫描不存在")
+        d = views.scan_view(conn, row)
+        d["联动刷新"] = views.build_linkage(conn, d.get("chute_id"), scan_id)
+        return d
 
 
 @router.post("/扫描")
 def create_scan(body: ScanIn):
-    with db() as conn:
+    def work(conn):
         require_unsealed(conn)
         shift = current_shift(conn)
-        line = None
         if body.分拣线编号:
             line = conn.execute("SELECT * FROM lines WHERE id=?", (body.分拣线编号,)).fetchone()
         else:
@@ -58,37 +84,39 @@ def create_scan(body: ScanIn):
             (body.条码, shift["id"]),
         ).fetchone()
         audit(conn, "扫描", row["id"], "过机装载", body.条码)
-        return row_to_dict(row)
+        return dict(row)
+
+    return run_write(work)
 
 
 @router.post("/扫描/{scan_id}/路由")
 def route_scan(scan_id: int):
+    # 唯一裁决落锤入口（闭口优先仲裁）；回执即同刷视图
+    return collision.adjudicate(scan_id)
+
+
+@router.post("/扫描/{scan_id}/裁决")
+def adjudicate_scan_alias(scan_id: int):
+    return collision.adjudicate(scan_id)
+
+
+@router.post("/裁决/{scan_id}")
+def adjudicate_short_alias(scan_id: int):
+    return collision.adjudicate(scan_id)
+
+
+@router.post("/裁决")
+def adjudicate_body(body: AdjudicateIn):
+    has_any = any(v is not None for v in (
+        body.扫描编号, body.scan_id, body.id, body.条码, body.barcode))
     with db() as conn:
-        require_unsealed(conn)
-        scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
-        if not scan:
+        scan_id = collision.resolve_scan_id(
+            conn,
+            扫描编号=body.扫描编号, scan_id=body.scan_id, id=body.id,
+            条码=body.条码, barcode=body.barcode,
+        )
+    if scan_id is None:
+        if has_any:
             raise HTTPException(404, "扫描不存在")
-        if scan["status"] not in ("待路由", "错分回流"):
-            raise HTTPException(400, f"当前状态不可路由: {scan['status']}")
-        if not scan["dest_code"]:
-            raise HTTPException(400, "缺少目的地码")
-        rule = conn.execute(
-            "SELECT * FROM route_rules WHERE dest_code=?", (scan["dest_code"],)
-        ).fetchone()
-        if not rule:
-            raise HTTPException(400, "无匹配路由")
-        chute = conn.execute("SELECT * FROM chutes WHERE id=?", (rule["chute_id"],)).fetchone()
-        if not chute:
-            raise HTTPException(400, "口门不存在")
-        if chute["status"] != "口门开":
-            raise HTTPException(400, "口门已闭，禁止落入")
-        conn.execute(
-            "UPDATE scans SET status='已路由', chute_id=? WHERE id=?",
-            (chute["id"], scan_id),
-        )
-        conn.execute(
-            "INSERT INTO route_events(scan_id, chute_id, action, created_at, note) VALUES (?, ?, ?, ?, ?)",
-            (scan_id, chute["id"], "路由落入", now_str(), chute["code"]),
-        )
-        audit(conn, "扫描", scan_id, "路由裁决", chute["code"])
-        return row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        raise HTTPException(400, "缺少扫描编号")
+    return collision.adjudicate(scan_id)

@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db, rows_to_list, row_to_dict
 from app.services.common import audit, current_shift, now_str, require_unsealed
+from app.services import views
 
 router = APIRouter(tags=["错分回流"])
 
@@ -10,6 +11,12 @@ router = APIRouter(tags=["错分回流"])
 class DivertIn(BaseModel):
     扫描编号: int
     备注: str = ""
+
+
+@router.get("/回流入口")
+def divert_entry():
+    with db() as conn:
+        return views.divert_entry(conn)
 
 
 @router.get("/回流批次")

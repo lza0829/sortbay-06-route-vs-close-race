@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db, rows_to_list, row_to_dict
 from app.services.common import audit, now_str
+from app.services import collision
 
 router = APIRouter(tags=["班次"])
 
@@ -44,7 +45,7 @@ def reconcile(shift_id: int | None = None):
             "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('待路由','错分回流')",
             (sid,),
         ).fetchone()["c"]
-        return {
+        result = {
             "班次": row_to_dict(shift),
             "扫描总数": scan_n,
             "已路由及以上": routed,
@@ -53,6 +54,14 @@ def reconcile(shift_id: int | None = None):
             "回流批次数": divert_n,
             "未清件数": pending,
         }
+    # 把闭口/裁决争用对账并到既有班次对账（附加字段，不改原键）
+    report = collision.consistency_report()
+    result["争用一致"] = report["一致"]
+    result["争用异常数"] = report["异常数"]
+    result["架构口径"] = collision.ARCHITECTURE
+    # 别名：班次对账整体是否干净（含争用面）
+    result["一致"] = report["一致"]
+    return result
 
 
 @router.post("/班次")
